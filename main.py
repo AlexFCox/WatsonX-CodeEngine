@@ -13,7 +13,6 @@ import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 
 app = FastAPI(title="SalesBud Proxy", version="1.0.0")
 
@@ -27,11 +26,12 @@ app.add_middleware(
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-IBM_API_KEY       = os.environ["IBM_API_KEY"]
-WXO_INSTANCE_GUID = os.environ["WXO_INSTANCE_GUID"]
-WXO_AGENT_ID      = os.environ["WXO_AGENT_ID"]
-WXO_BASE_URL      = f"https://api.eu-de.watson-orchestrate.cloud.ibm.com/instances/{WXO_INSTANCE_GUID}"
-IAM_TOKEN_URL     = "https://iam.cloud.ibm.com/identity/token"
+IBM_API_KEY        = os.environ["IBM_API_KEY"]
+WXO_INSTANCE_GUID  = os.environ["WXO_INSTANCE_GUID"]
+WXO_AGENT_ID       = os.environ["WXO_AGENT_ID"]
+WXO_AUTH_AGENT_ID  = "6c98d390-dfc7-4b8f-b11e-bf36dd148c80"
+WXO_BASE_URL       = f"https://api.eu-de.watson-orchestrate.cloud.ibm.com/instances/{WXO_INSTANCE_GUID}"
+IAM_TOKEN_URL      = "https://iam.cloud.ibm.com/identity/token"
 
 # ── Token cache ───────────────────────────────────────────────────────────────
 _token_cache: dict = {"token": None, "expires_at": 0}
@@ -62,7 +62,7 @@ def get_iam_token() -> str:
 
 # ── Models ────────────────────────────────────────────────────────────────────
 class Message(BaseModel):
-    role: str     # "user" or "assistant"
+    role: str      # "user" or "assistant"
     content: str
 
 
@@ -74,25 +74,19 @@ class ChatResponse(BaseModel):
     reply: str
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
+# ── Shared SSE helper ─────────────────────────────────────────────────────────
+def _call_agent(agent_id: str, messages: list[Message]) -> str:
     """
-    Send full conversation history to SalesBud Orchestrator.
-    Orchestrate does not persist threads, so we replay the full history each time.
+    Send full conversation history to a given WXO agent.
+    Returns the completed reply text.
     """
     token = get_iam_token()
 
     payload = {
-        "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+        "messages": [{"role": m.role, "content": m.content} for m in messages],
     }
 
-    url = f"{WXO_BASE_URL}/v1/orchestrate/{WXO_AGENT_ID}/chat/completions"
+    url = f"{WXO_BASE_URL}/v1/orchestrate/{agent_id}/chat/completions"
 
     full_text = ""
 
@@ -140,4 +134,31 @@ def chat(req: ChatRequest):
             except (KeyError, IndexError):
                 continue
 
-    return {"reply": full_text}
+    return full_text
+
+
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/auth", response_model=ChatResponse)
+def auth(req: ChatRequest):
+    """
+    Send conversation history to the SalesBud Auth Agent.
+    Handles user identification and Salesforce lookup.
+    Replies contain AUTH_COMPLETE once the user is confirmed.
+    """
+    reply = _call_agent(WXO_AUTH_AGENT_ID, req.messages)
+    return {"reply": reply}
+
+
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest):
+    """
+    Send full conversation history to SalesBud Orchestrator.
+    Orchestrate does not persist threads, so we replay the full history each time.
+    """
+    reply = _call_agent(WXO_AGENT_ID, req.messages)
+    return {"reply": reply}
