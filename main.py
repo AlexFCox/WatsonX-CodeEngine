@@ -19,7 +19,7 @@ app = FastAPI(title="SalesBud Proxy", version="1.0.0")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 ALLOWED_ORIGINS = [
-    "https://your-salesbud-app.vercel.app",   # ← replace with your actual Vercel URL
+    "https://watson-x-planted-frontend.vercel.app/", 
     "http://localhost:5173",
     "http://localhost:3000",
 ]
