@@ -2,9 +2,8 @@
 SalesBud – watsonx Orchestrate Chat Proxy
 Deployed to IBM Code Engine (group13, eu-de)
 
-Flow:
-  POST /chat  →  get IAM token  →  exchange for WXO token  →  call Orchestrate chat API  →  return response
-  POST /chat/new  →  create a new thread, return thread_id
+The Orchestrate API streams responses as SSE chunks.
+This proxy collects all chunks and returns a single JSON response to the frontend.
 """
 
 import os
@@ -14,14 +13,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
+import json
 
 app = FastAPI(title="SalesBud Proxy", version="1.0.0")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Allow your Vercel frontend (and localhost for dev) to call this API
 ALLOWED_ORIGINS = [
     "https://your-salesbud-app.vercel.app",   # ← replace with your actual Vercel URL
-    "http://localhost:5173",                   # Vite dev server
+    "http://localhost:5173",
     "http://localhost:3000",
 ]
 
@@ -33,23 +32,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Config from environment variables (set in Code Engine) ────────────────────
-IBM_API_KEY          = os.environ["IBM_API_KEY"]           # Your IBM Cloud IAM API key
-WXO_INSTANCE_GUID    = os.environ["WXO_INSTANCE_GUID"]     # 64926151-85dd-4264-90c8-53185f9e93ff
-WXO_AGENT_ID         = os.environ["WXO_AGENT_ID"]          # a4f6e8b7-be3c-4c81-97f6-91a131a03b74
-WXO_HOST             = os.environ.get(
-    "WXO_HOST", "https://api.eu-de.watson-orchestrate.cloud.ibm.com"
-)
+# ── Config ────────────────────────────────────────────────────────────────────
+IBM_API_KEY       = os.environ["IBM_API_KEY"]
+WXO_INSTANCE_GUID = os.environ["WXO_INSTANCE_GUID"]  # 946df986-9572-455e-bc1f-be9c5c5ec40e
+WXO_AGENT_ID      = os.environ["WXO_AGENT_ID"]        # 155d8a0d-0649-4f95-bb39-c1f5389c4685
+WXO_BASE_URL      = f"https://api.eu-de.watson-orchestrate.cloud.ibm.com/instances/{WXO_INSTANCE_GUID}"
 
-IAM_TOKEN_URL        = "https://iam.cloud.ibm.com/identity/token"
-WXO_INSTANCE_URL     = f"{WXO_HOST}/instances/{WXO_INSTANCE_GUID}"
+IAM_TOKEN_URL     = "https://iam.cloud.ibm.com/identity/token"
 
-# ── Token cache (in-memory, reused across requests in the same container) ─────
+# ── Token cache ───────────────────────────────────────────────────────────────
 _token_cache: dict = {"token": None, "expires_at": 0}
 
 
 def get_iam_token() -> str:
-    """Exchange IBM API key for an IAM access token. Cached for 55 minutes."""
     now = time.time()
     if _token_cache["token"] and now < _token_cache["expires_at"]:
         return _token_cache["token"]
@@ -68,103 +63,94 @@ def get_iam_token() -> str:
 
     data = resp.json()
     _token_cache["token"] = data["access_token"]
-    _token_cache["expires_at"] = now + 3300  # tokens valid 60 min, refresh at 55
+    _token_cache["expires_at"] = now + 3300
     return _token_cache["token"]
 
 
-# ── Request / Response models ─────────────────────────────────────────────────
-
+# ── Models ────────────────────────────────────────────────────────────────────
 class ChatRequest(BaseModel):
     message: str
-    thread_id: Optional[str] = None   # pass back the thread_id from previous turns
+    thread_id: Optional[str] = None  # pass back on subsequent turns to maintain context
 
 
 class ChatResponse(BaseModel):
     reply: str
-    thread_id: str
-
-
-class NewThreadResponse(BaseModel):
-    thread_id: str
+    thread_id: Optional[str] = None
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.post("/chat/new", response_model=NewThreadResponse)
-def new_thread():
-    """
-    Call this once at the start of a session to get a thread_id.
-    Pass that thread_id in every subsequent /chat call.
-    """
-    token = get_iam_token()
-    resp = httpx.post(
-        f"{WXO_INSTANCE_URL}/v1/threads",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "agent_id": WXO_AGENT_ID,
-            "title": "SalesBud session",
-        },
-        timeout=20,
-    )
-    if resp.status_code not in (200, 201):
-        raise HTTPException(status_code=502, detail=f"Thread creation failed: {resp.text}")
-
-    thread_id = resp.json().get("id") or resp.json().get("thread_id")
-    return {"thread_id": thread_id}
-
-
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     """
-    Send a message to the SalesBud Orchestrator and return its reply.
-    Pass thread_id from a previous /chat/new call to maintain conversation state.
-    If no thread_id is provided, a new thread is created automatically.
+    Send a message to SalesBud Orchestrator.
+    Handles the SSE streaming response and returns the full reply as JSON.
+    Pass thread_id from previous responses to maintain conversation state.
     """
     token = get_iam_token()
 
-    # Auto-create thread if not provided
+    # Build payload — include thread_id if continuing a conversation
+    payload = {
+        "messages": [{"role": "user", "content": req.message}],
+    }
+    if req.thread_id:
+        payload["thread_id"] = req.thread_id
+
+    url = f"{WXO_BASE_URL}/v1/orchestrate/{WXO_AGENT_ID}/chat/completions"
+
+    full_text = ""
     thread_id = req.thread_id
-    if not thread_id:
-        thread_resp = new_thread()
-        thread_id = thread_resp.thread_id
 
-    # Build messages array — Orchestrate uses OpenAI-style format
-    messages = [{"role": "user", "content": req.message}]
-
-    resp = httpx.post(
-        f"{WXO_INSTANCE_URL}/v1/orchestrate/{WXO_AGENT_ID}/chat/completions",
+    with httpx.stream(
+        "POST",
+        url,
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
-        json={
-            "messages": messages,
-            "thread_id": thread_id,
-            "stream": False,
-        },
-        timeout=120,   # Orchestrate multi-agent flows can take 60-90s
-    )
+        json=payload,
+        timeout=120,
+    ) as response:
+        if response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Orchestrate error {response.status_code}: {response.read().decode()}"
+            )
 
-    if resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Orchestrate error: {resp.text}")
+        for line in response.iter_lines():
+            if not line or not line.startswith("data: "):
+                continue
 
-    data = resp.json()
+            raw = line[len("data: "):]
+            if raw.strip() == "[DONE]":
+                break
 
-    # Extract the assistant reply — structure mirrors OpenAI chat completions
-    try:
-        reply = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError):
-        reply = str(data)   # fallback: return raw if structure differs
+            try:
+                chunk = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
 
-    # thread_id may come back in the response or stay as-is
-    returned_thread_id = data.get("thread_id", thread_id)
+            # Grab thread_id from any chunk that has it
+            if not thread_id and chunk.get("thread_id"):
+                thread_id = chunk["thread_id"]
 
-    return {"reply": reply, "thread_id": returned_thread_id}
+            # The completed message has the full text — prefer that
+            if chunk.get("object") == "thread.message.completed":
+                try:
+                    full_text = chunk["data"]["message"]["content"][0]["text"]
+                except (KeyError, IndexError):
+                    pass
+                break
+
+            # Otherwise accumulate delta chunks
+            try:
+                delta = chunk["choices"][0]["delta"].get("content", "")
+                full_text += delta
+            except (KeyError, IndexError):
+                continue
+
+    return {"reply": full_text, "thread_id": thread_id}
