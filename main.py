@@ -2,8 +2,8 @@
 SalesBud – watsonx Orchestrate Chat Proxy
 Deployed to IBM Code Engine (group13, eu-de)
 
-Orchestrate does not support thread_id continuation.
-We send the full conversation history on every request instead.
+Uses the /api/v1/orchestrate/runs/stream endpoint with thread_id for session persistence.
+Orchestrate maintains conversation state — no need to replay full history.
 """
 
 import os
@@ -14,8 +14,9 @@ import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 
-app = FastAPI(title="SalesBud Proxy", version="1.0.0")
+app = FastAPI(title="SalesBud Proxy", version="2.0.0")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
@@ -27,11 +28,11 @@ app.add_middleware(
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
-IBM_API_KEY        = os.environ["IBM_API_KEY"]
-WXO_INSTANCE_GUID  = os.environ["WXO_INSTANCE_GUID"]
-WXO_AGENT_ID       = os.environ["WXO_AGENT_ID"]
-WXO_BASE_URL       = f"https://api.eu-de.watson-orchestrate.cloud.ibm.com/instances/{WXO_INSTANCE_GUID}"
-IAM_TOKEN_URL      = "https://iam.cloud.ibm.com/identity/token"
+IBM_API_KEY       = os.environ["IBM_API_KEY"]
+WXO_INSTANCE_GUID = os.environ["WXO_INSTANCE_GUID"]
+WXO_AGENT_ID      = os.environ["WXO_AGENT_ID"]
+WXO_BASE_URL      = f"https://api.eu-de.watson-orchestrate.cloud.ibm.com/instances/{WXO_INSTANCE_GUID}"
+IAM_TOKEN_URL     = "https://iam.cloud.ibm.com/identity/token"
 
 # ── Token cache ───────────────────────────────────────────────────────────────
 _token_cache: dict = {"token": None, "expires_at": 0}
@@ -61,54 +62,53 @@ def get_iam_token() -> str:
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
-class Message(BaseModel):
-    role: str      # "user" or "assistant"
-    content: str
-
-
 class ChatRequest(BaseModel):
-    messages: list[Message]   # full conversation history including latest user message
+    message: str                  # latest user message only
+    thread_id: Optional[str] = None  # None on first message, returned from prior response
 
 
 class ChatResponse(BaseModel):
     reply: str
+    thread_id: Optional[str] = None  # return to frontend for next request
 
 
 # ── SSE helper ────────────────────────────────────────────────────────────────
-# Flow notification strings from Orchestrate that should NOT be returned to the user.
-# These are internal status messages emitted when a tool/flow starts or resumes.
-FLOW_NOISE = (
+FLOW_NOISE_PHRASES = [
     "a new flow has started",
     "this chat session is currently dedicated to the flow",
     "will resume once the flow is complete",
-)
+]
 
-def _is_flow_noise(text: str) -> bool:
+def is_flow_noise(text: str) -> bool:
     low = text.lower()
-    return any(phrase in low for phrase in FLOW_NOISE)
+    return any(phrase in low for phrase in FLOW_NOISE_PHRASES)
 
 
-def _call_agent(agent_id: str, messages: list[Message]) -> str:
+def _call_agent(message: str, thread_id: Optional[str]) -> tuple[str, Optional[str]]:
     """
-    Send full conversation history to a given WXO agent.
-    Returns the final completed reply text, skipping flow noise events.
-
-    Key behaviour:
-    - Collects ALL thread.message.completed events, not just the first.
-    - Skips any whose text is a flow status notification.
-    - Returns the last non-noise completed message text.
-    - Falls back to accumulated delta text if no completed message found.
+    Send a single user message to WXO via /runs/stream endpoint.
+    Returns (reply_text, thread_id).
+    thread_id is returned by Orchestrate and must be sent on subsequent requests
+    to maintain session state.
     """
     token = get_iam_token()
 
     payload = {
-        "messages": [{"role": m.role, "content": m.content} for m in messages],
+        "agent_id": WXO_AGENT_ID,
+        "message": {
+            "role": "user",
+            "content": message,
+        },
     }
 
-    url = f"{WXO_BASE_URL}/v1/orchestrate/{agent_id}/chat/completions"
+    # Include thread_id if we have one (continues existing session)
+    if thread_id:
+        payload["thread_id"] = thread_id
 
-    delta_text  = ""   # accumulated from streaming deltas
-    final_texts = []   # all thread.message.completed texts (excluding noise)
+    url = f"{WXO_BASE_URL}/api/v1/orchestrate/runs/stream"
+
+    reply_text = ""
+    returned_thread_id = thread_id  # keep existing if not returned
 
     with httpx.stream(
         "POST",
@@ -118,16 +118,23 @@ def _call_agent(agent_id: str, messages: list[Message]) -> str:
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=180,   # flows can take time — give them 3 minutes
+        timeout=180,
     ) as response:
         if response.status_code != 200:
+            body = response.read().decode()
+            print(f"[ERROR] Orchestrate {response.status_code}: {body}", file=sys.stderr, flush=True)
             raise HTTPException(
                 status_code=502,
-                detail=f"Orchestrate error {response.status_code}: {response.read().decode()}"
+                detail=f"Orchestrate error {response.status_code}: {body}"
             )
 
         for line in response.iter_lines():
-            if not line or not line.startswith("data: "):
+            if not line:
+                continue
+
+            print(f"[SSE raw] {line[:200]}", file=sys.stderr, flush=True)
+
+            if not line.startswith("data: "):
                 continue
 
             raw = line[len("data: "):]
@@ -139,49 +146,73 @@ def _call_agent(agent_id: str, messages: list[Message]) -> str:
             except json.JSONDecodeError:
                 continue
 
-            obj = chunk.get("object", "")
+            event = chunk.get("event", "")
+            data  = chunk.get("data", {})
 
-            # Log every event type for debugging
-            print(f"[SSE] object={obj!r}", file=sys.stderr, flush=True)
+            print(f"[SSE] event={event!r}", file=sys.stderr, flush=True)
 
-            # Completed message event — collect but skip flow noise
-            if obj == "thread.message.completed":
+            # Extract thread_id whenever it appears
+            if isinstance(data, dict):
+                tid = data.get("thread_id") or data.get("id")
+                if tid and not returned_thread_id:
+                    returned_thread_id = tid
+                    print(f"[SSE] thread_id captured: {tid}", file=sys.stderr, flush=True)
+
+            # Message completed — extract text
+            if event == "message.completed":
                 try:
-                    text = chunk["data"]["message"]["content"][0]["text"]
-                    print(f"[SSE] completed text preview: {text[:120]!r}", file=sys.stderr, flush=True)
-                    if not _is_flow_noise(text):
-                        final_texts.append(text)
-                        delta_text = ""  # reset delta accumulation
-                except (KeyError, IndexError):
+                    content = data.get("message", {}).get("content", [])
+                    if isinstance(content, list) and content:
+                        text = content[0].get("text", "")
+                    elif isinstance(content, str):
+                        text = content
+                    else:
+                        text = ""
+
+                    print(f"[SSE] message.completed text: {text[:120]!r}", file=sys.stderr, flush=True)
+
+                    if text and not is_flow_noise(text):
+                        reply_text = text
+
+                except (KeyError, IndexError, TypeError) as e:
+                    print(f"[SSE] parse error: {e}", file=sys.stderr, flush=True)
+                continue
+
+            # run.completed — stream is done
+            if event in ("run.completed", "done"):
+                break
+
+            # flow.slot.listen — flow is waiting for input, keep reading
+            if event == "flow.slot.listen":
+                print(f"[SSE] flow.slot.listen — flow waiting for input", file=sys.stderr, flush=True)
+                continue
+
+            # Delta text accumulation (fallback)
+            if event == "message.delta":
+                try:
+                    delta = data.get("delta", {}).get("content", "")
+                    if isinstance(delta, str):
+                        reply_text += delta
+                    elif isinstance(delta, list) and delta:
+                        reply_text += delta[0].get("text", "")
+                except (KeyError, TypeError):
                     pass
-                # Do NOT break — keep reading for more events after flow completes
-                continue
 
-            # Delta streaming chunks
-            try:
-                delta = chunk["choices"][0]["delta"].get("content", "")
-                if delta:
-                    delta_text += delta
-            except (KeyError, IndexError):
-                continue
-
-    # Return the last non-noise completed message, or fall back to deltas
-    if final_texts:
-        return final_texts[-1]
-    return delta_text.strip()
+    return reply_text.strip(), returned_thread_id
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     """
-    Send full conversation history to SalesBud Orchestrator.
-    Orchestrate does not persist threads, so we replay the full history each time.
+    Send a single user message to SalesBud Orchestrator.
+    Pass thread_id from previous response to continue the session.
+    Returns reply text and thread_id for next request.
     """
-    reply = _call_agent(WXO_AGENT_ID, req.messages)
-    return {"reply": reply}
+    reply, thread_id = _call_agent(req.message, req.thread_id)
+    return {"reply": reply, "thread_id": thread_id}
