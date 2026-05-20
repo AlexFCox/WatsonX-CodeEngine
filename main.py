@@ -7,6 +7,7 @@ We send the full conversation history on every request instead.
 """
 
 import os
+import sys
 import time
 import httpx
 import json
@@ -29,7 +30,6 @@ app.add_middleware(
 IBM_API_KEY        = os.environ["IBM_API_KEY"]
 WXO_INSTANCE_GUID  = os.environ["WXO_INSTANCE_GUID"]
 WXO_AGENT_ID       = os.environ["WXO_AGENT_ID"]
-WXO_AUTH_AGENT_ID  = "6c98d390-dfc7-4b8f-b11e-bf36dd148c80"
 WXO_BASE_URL       = f"https://api.eu-de.watson-orchestrate.cloud.ibm.com/instances/{WXO_INSTANCE_GUID}"
 IAM_TOKEN_URL      = "https://iam.cloud.ibm.com/identity/token"
 
@@ -74,11 +74,30 @@ class ChatResponse(BaseModel):
     reply: str
 
 
-# ── Shared SSE helper ─────────────────────────────────────────────────────────
+# ── SSE helper ────────────────────────────────────────────────────────────────
+# Flow notification strings from Orchestrate that should NOT be returned to the user.
+# These are internal status messages emitted when a tool/flow starts or resumes.
+FLOW_NOISE = (
+    "a new flow has started",
+    "this chat session is currently dedicated to the flow",
+    "will resume once the flow is complete",
+)
+
+def _is_flow_noise(text: str) -> bool:
+    low = text.lower()
+    return any(phrase in low for phrase in FLOW_NOISE)
+
+
 def _call_agent(agent_id: str, messages: list[Message]) -> str:
     """
     Send full conversation history to a given WXO agent.
-    Returns the completed reply text.
+    Returns the final completed reply text, skipping flow noise events.
+
+    Key behaviour:
+    - Collects ALL thread.message.completed events, not just the first.
+    - Skips any whose text is a flow status notification.
+    - Returns the last non-noise completed message text.
+    - Falls back to accumulated delta text if no completed message found.
     """
     token = get_iam_token()
 
@@ -88,7 +107,8 @@ def _call_agent(agent_id: str, messages: list[Message]) -> str:
 
     url = f"{WXO_BASE_URL}/v1/orchestrate/{agent_id}/chat/completions"
 
-    full_text = ""
+    delta_text  = ""   # accumulated from streaming deltas
+    final_texts = []   # all thread.message.completed texts (excluding noise)
 
     with httpx.stream(
         "POST",
@@ -98,7 +118,7 @@ def _call_agent(agent_id: str, messages: list[Message]) -> str:
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=120,
+        timeout=180,   # flows can take time — give them 3 minutes
     ) as response:
         if response.status_code != 200:
             raise HTTPException(
@@ -119,39 +139,42 @@ def _call_agent(agent_id: str, messages: list[Message]) -> str:
             except json.JSONDecodeError:
                 continue
 
-            # Prefer the completed message which has the full text
-            if chunk.get("object") == "thread.message.completed":
+            obj = chunk.get("object", "")
+
+            # Log every event type for debugging
+            print(f"[SSE] object={obj!r}", file=sys.stderr, flush=True)
+
+            # Completed message event — collect but skip flow noise
+            if obj == "thread.message.completed":
                 try:
-                    full_text = chunk["data"]["message"]["content"][0]["text"]
+                    text = chunk["data"]["message"]["content"][0]["text"]
+                    print(f"[SSE] completed text preview: {text[:120]!r}", file=sys.stderr, flush=True)
+                    if not _is_flow_noise(text):
+                        final_texts.append(text)
+                        delta_text = ""  # reset delta accumulation
                 except (KeyError, IndexError):
                     pass
-                break
+                # Do NOT break — keep reading for more events after flow completes
+                continue
 
-            # Otherwise accumulate deltas
+            # Delta streaming chunks
             try:
                 delta = chunk["choices"][0]["delta"].get("content", "")
-                full_text += delta
+                if delta:
+                    delta_text += delta
             except (KeyError, IndexError):
                 continue
 
-    return full_text
+    # Return the last non-noise completed message, or fall back to deltas
+    if final_texts:
+        return final_texts[-1]
+    return delta_text.strip()
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-@app.post("/auth", response_model=ChatResponse)
-def auth(req: ChatRequest):
-    """
-    Send conversation history to the SalesBud Auth Agent.
-    Handles user identification and Salesforce lookup.
-    Replies contain AUTH_COMPLETE once the user is confirmed.
-    """
-    reply = _call_agent(WXO_AUTH_AGENT_ID, req.messages)
-    return {"reply": reply}
 
 
 @app.post("/chat", response_model=ChatResponse)
