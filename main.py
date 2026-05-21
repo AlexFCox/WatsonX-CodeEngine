@@ -44,7 +44,7 @@ app.add_middleware(
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 IBM_API_KEY        = os.environ["IBM_API_KEY"]
 WXO_INSTANCE_GUID  = os.environ.get("WXO_INSTANCE_GUID", "946df986-9572-455e-bc1f-be9c5c5ec40e")
-WXO_HOST           = f"https://eu-de.watson-orchestrate.cloud.ibm.com/{WXO_INSTANCE_GUID}"
+WXO_HOST           = "https://eu-de.watson-orchestrate.cloud.ibm.com"
 AUTH_AGENT_ID      = os.environ.get("AUTH_AGENT_ID", "6c98d390-dfc7-4b8f-b11e-bf36dd148c80")
 ORCHESTRATOR_ID    = os.environ.get("ORCHESTRATOR_ID", "b2340dd1-11f7-4234-b073-125d85d78c98")
 
