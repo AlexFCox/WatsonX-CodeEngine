@@ -1,25 +1,40 @@
 """
-SalesBud – watsonx Orchestrate Chat Proxy v3.0
+SalesBud – watsonx Orchestrate Chat Proxy v3.1
 Deployed to IBM Code Engine (group13, eu-de)
 
-KEY CHANGE vs v2.2: Full async_wait loop (Approach B).
+CONFIRMED API FACTS (cross-referenced against IBM ADK docs + working v2.2):
 
-When the agent calls a Flow-backed tool, WxO transitions the run to
-async_wait status. Previously the proxy would time out because it was
-waiting for message.completed that never arrived.
+  Chat endpoint (cloud production):
+    POST /api/v1/orchestrate/{agent_id}/chat/completions
+    Header: Authorization: Bearer <iam_token>
+    Header: X-IBM-THREAD-ID: <thread_id>   ← session continuity, optional first turn
+    Body:   {"messages": [{"role": "user", "content": "..."}], "stream": true}
+    Response: SSE stream, each line "data: {...}"
+              chunk.object = "thread.message.delta"     ← streaming text
+              chunk.object = "thread.message.completed" ← final full text
+              chunk.thread_id                            ← capture and reuse
+              "[DONE]"                                   ← stream end marker
 
-Now the proxy:
-  1. Starts a run via /runs/stream, collects SSE events.
-  2. Detects async_wait (run.step events containing tool_use with
-     is_async=true, or status poll showing async_wait).
-  3. Polls GET /runs/{run_id} until status = async_completed.
-  4. Extracts tool results from the completed run's step_history.
-  5. Submits a follow-up POST /runs with role=tool messages.
-  6. Loops until a run completes cleanly (no more async_wait).
+  Run status endpoint (for async_wait polling):
+    GET /api/v1/orchestrate/runs/{run_id}
+    Header: Authorization: Bearer <iam_token>
+    Response: {"status": "pending|running|completed|async_wait|async_completed|failed|cancelled"}
+
+  IAM token exchange (standard IBM Cloud):
+    POST https://iam.cloud.ibm.com/identity/token
+    Body: grant_type=urn:ibm:params:oauth:grant-type:apikey&apikey=<key>
+
+ASYNC FLOW HANDLING (Approach B):
+  When a Flow-backed tool is called, the SSE stream ends without
+  thread.message.completed. The proxy detects this (empty reply after [DONE])
+  and polls GET /runs/{run_id} until async_completed, then sends a follow-up
+  message to resume the agent.
+
+  Run IDs are extracted from SSE chunks that contain chunk.id or chunk.run_id.
 """
 
 import os
-import re
+import sys
 import time
 import json
 import asyncio
@@ -27,9 +42,9 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Any
+from typing import Optional
 
-app = FastAPI(title="SalesBud Proxy", version="3.0.0")
+app = FastAPI(title="SalesBud Proxy", version="3.1.0")
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
@@ -42,19 +57,23 @@ app.add_middleware(
 )
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-IBM_API_KEY        = os.environ["IBM_API_KEY"]
-WXO_INSTANCE_GUID  = os.environ.get("WXO_INSTANCE_GUID", "946df986-9572-455e-bc1f-be9c5c5ec40e")
-WXO_HOST           = "https://eu-de.watson-orchestrate.cloud.ibm.com"
-AUTH_AGENT_ID      = os.environ.get("AUTH_AGENT_ID", "6c98d390-dfc7-4b8f-b11e-bf36dd148c80")
-ORCHESTRATOR_ID    = os.environ.get("ORCHESTRATOR_ID", "b2340dd1-11f7-4234-b073-125d85d78c98")
+IBM_API_KEY       = os.environ["IBM_API_KEY"]
+WXO_INSTANCE_GUID = os.environ.get("WXO_INSTANCE_GUID", "946df986-9572-455e-bc1f-be9c5c5ec40e")
 
-IAM_URL            = "https://iam.cloud.ibm.com/identity/token"
+# Cloud production base — confirmed working in v2.2
+# Endpoint: /api/v1/orchestrate/{agent_id}/chat/completions
+WXO_BASE_URL      = "https://eu-de.watson-orchestrate.cloud.ibm.com"
+
+# Agent IDs
+AUTH_AGENT_ID     = os.environ.get("AUTH_AGENT_ID",     "6c98d390-dfc7-4b8f-b11e-bf36dd148c80")
+ORCHESTRATOR_ID   = os.environ.get("ORCHESTRATOR_ID",   "b2340dd1-11f7-4234-b073-125d85d78c98")
+
+IAM_URL           = "https://iam.cloud.ibm.com/identity/token"
 
 # Async loop settings
-POLL_INTERVAL_S    = 1.0   # seconds between status polls
-POLL_MAX_ATTEMPTS  = 60    # max 60s before giving up on a single async tool
-ASYNC_LOOP_MAX     = 5     # max tool-call rounds per user turn (safety valve)
-STREAM_TIMEOUT_MS  = 90000 # ms — passed to WxO as stream_timeout
+POLL_INTERVAL_S   = 1.5   # seconds between status polls
+POLL_MAX_ATTEMPTS = 40    # 40 × 1.5s = 60s max wait per async tool
+ASYNC_LOOP_MAX    = 5     # safety valve: max tool-call rounds per user turn
 
 # ── IAM TOKEN CACHE ───────────────────────────────────────────────────────────
 _token_cache: dict = {}
@@ -67,13 +86,17 @@ async def get_iam_token() -> str:
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.post(
             IAM_URL,
-            data={"grant_type": "urn:ibm:params:oauth:grant-type:apikey", "apikey": IBM_API_KEY},
+            data={
+                "grant_type": "urn:ibm:params:oauth:grant-type:apikey",
+                "apikey": IBM_API_KEY,
+            },
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         resp.raise_for_status()
         data = resp.json()
-        _token_cache["token"] = data["access_token"]
+        _token_cache["token"]      = data["access_token"]
         _token_cache["expires_at"] = now + data.get("expires_in", 3600)
+        print(f"[proxy] IAM token refreshed", flush=True)
         return _token_cache["token"]
 
 # ── PYDANTIC MODELS ───────────────────────────────────────────────────────────
@@ -93,416 +116,330 @@ class AuthRequest(BaseModel):
     history: list[Message] = []
     thread_id: Optional[str] = None
 
-# ── WXO MESSAGE BUILDER ───────────────────────────────────────────────────────
-def build_wxo_message(role: str, text: str, tool_call_id: str = None) -> dict:
-    """Build a WxO-shaped message object."""
-    msg = {
-        "role": role,
-        "content": [{"response_type": "text", "text": text}],
-    }
-    if tool_call_id:
-        msg["additional_properties"] = {
-            "tool_call_id": tool_call_id,
-            "display_properties": {"skip_render": True, "is_async": False},
-        }
-    return msg
+# ── FLOW NOISE FILTER ─────────────────────────────────────────────────────────
+# The agent emits internal status messages when calling flows. Filter them out
+# so they don't appear as the final reply to the user.
+FLOW_NOISE_PATTERNS = [
+    "starting flow", "flow started", "flow instance",
+    "running tool", "calling tool", "tool call",
+    "fetching", "looking up", "searching for",
+    "please wait", "one moment",
+]
 
-def build_wxo_history(history: list[Message]) -> list[dict]:
-    return [build_wxo_message(m.role, m.content) for m in history]
+def is_flow_noise(text: str) -> bool:
+    t = text.lower().strip()
+    if len(t) < 5:
+        return True
+    return any(p in t for p in FLOW_NOISE_PATTERNS)
 
-# ── CORE: STREAM + ASYNC_WAIT LOOP ────────────────────────────────────────────
-
-async def run_agent_turn(
+# ── CORE: SSE STREAM CONSUMER ─────────────────────────────────────────────────
+async def call_agent_stream(
     agent_id: str,
-    message_text: str,
-    history: list[Message],
+    messages: list[dict],
     thread_id: Optional[str],
-    context_variables: dict = {},
 ) -> dict:
     """
-    Execute one user turn, handling async_wait loops automatically.
-
-    Returns:
-        {
-          "reply": str,           # final assistant text
-          "thread_id": str,       # thread to reuse next turn
-          "async_rounds": int,    # how many async loops occurred
-        }
+    POST to /api/v1/orchestrate/{agent_id}/chat/completions with stream=true.
+    Consumes the SSE stream and returns:
+      {
+        "reply":     str,          # assembled final text (may be empty on async_wait)
+        "thread_id": str | None,   # capture and reuse next turn
+        "run_id":    str | None,   # needed for polling async runs
+        "finished":  bool,         # True = got thread.message.completed or [DONE] with text
+        "async_wait": bool,        # True = stream ended without a final answer
+      }
     """
-    token = await get_iam_token()
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    token  = await get_iam_token()
+    url    = f"{WXO_BASE_URL}/api/v1/orchestrate/{agent_id}/chat/completions"
 
-    # Build the initial payload
-    wxo_history = build_wxo_history(history)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+    }
+    if thread_id:
+        headers["X-IBM-THREAD-ID"] = thread_id
+
     payload = {
-        "agent_id": agent_id,
-        "message": build_wxo_message("user", message_text),
-        "thread_id": thread_id,
-        "context_variables": context_variables,
-        "stream_timeout": STREAM_TIMEOUT_MS,
+        "messages": messages,
+        "stream":   True,
     }
 
-    current_thread_id = thread_id
-    final_reply = ""
-    async_rounds = 0
-
-    for loop in range(ASYNC_LOOP_MAX + 1):
-        # ── STEP 1: POST /runs/stream ─────────────────────────────────────
-        stream_url = f"{WXO_HOST}/api/v1/orchestrate/runs/stream"
-        sse_result = await consume_sse_stream(stream_url, headers, payload)
-
-        current_thread_id = sse_result.get("thread_id") or current_thread_id
-        run_id            = sse_result.get("run_id")
-
-        # ── STEP 2: Did the run complete cleanly? ─────────────────────────
-        if sse_result["status"] == "completed":
-            final_reply = sse_result["reply"]
-            break
-
-        # ── STEP 3: async_wait — poll until async_completed ───────────────
-        if sse_result["status"] == "async_wait":
-            async_rounds += 1
-            print(f"[proxy] async_wait detected on loop {loop}, run_id={run_id}")
-
-            completed_run = await poll_until_async_completed(run_id, headers)
-            if not completed_run:
-                # Timed out waiting for flows
-                final_reply = (
-                    "I'm sorry — one of the background tools is taking too long to respond. "
-                    "Please try again in a moment."
-                )
-                break
-
-            # ── STEP 4: Extract tool results from the completed run ───────
-            tool_results = extract_tool_results(completed_run)
-            print(f"[proxy] Got {len(tool_results)} tool result(s) from async run")
-
-            if not tool_results:
-                # Fallback: no structured results found, prod the agent to continue
-                payload = {
-                    "agent_id": agent_id,
-                    "message": build_wxo_message(
-                        "user",
-                        "The background tool has completed. Please continue."
-                    ),
-                    "thread_id": current_thread_id,
-                    "context_variables": context_variables,
-                    "stream_timeout": STREAM_TIMEOUT_MS,
-                }
-            else:
-                # ── STEP 5: Submit tool results as follow-up messages ─────
-                # WxO expects one message per tool result with role=tool
-                # We send the first result; if there are multiple, chain them
-                tool_messages = []
-                for tr in tool_results:
-                    tool_messages.append(
-                        build_wxo_message(
-                            role="tool",
-                            text=json.dumps(tr["output"]) if isinstance(tr["output"], dict) else str(tr["output"]),
-                            tool_call_id=tr.get("tool_call_id"),
-                        )
-                    )
-
-                # Send the first tool result to resume the run
-                # (subsequent results sent in the same payload as additional history context)
-                first = tool_messages[0]
-                payload = {
-                    "agent_id": agent_id,
-                    "message": first,
-                    "thread_id": current_thread_id,
-                    "context_variables": context_variables,
-                    "stream_timeout": STREAM_TIMEOUT_MS,
-                }
-
-            # Loop continues — will POST /runs/stream again with tool result
-            continue
-
-        # ── Any other terminal status ─────────────────────────────────────
-        final_reply = sse_result.get("reply") or "An unexpected error occurred."
-        break
-
-    return {
-        "reply": final_reply,
-        "thread_id": current_thread_id,
-        "async_rounds": async_rounds,
-    }
-
-
-async def consume_sse_stream(url: str, headers: dict, payload: dict) -> dict:
-    """
-    POST to the WxO SSE stream endpoint and collect events until done or async_wait.
-
-    Returns:
-        {
-          "status":    "completed" | "async_wait" | "error",
-          "reply":     str,          # assembled assistant text (may be partial on async_wait)
-          "thread_id": str | None,
-          "run_id":    str | None,
-          "tool_calls": list,        # raw tool_use events captured
-        }
-    """
     reply_chunks: list[str] = []
-    thread_id = None
-    run_id    = None
-    tool_calls: list[dict] = []
-    final_status = "completed"
+    final_texts:  list[str] = []
+    returned_thread_id      = thread_id
+    run_id                  = None
+
+    print(f"[proxy] → POST {url} thread={thread_id}", flush=True)
 
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+        async with httpx.AsyncClient(timeout=180) as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as resp:
+
                 if resp.status_code != 200:
                     body = await resp.aread()
-                    print(f"[proxy] SSE request failed: {resp.status_code} — {body[:300]}")
-                    return {"status": "error", "reply": f"WxO error {resp.status_code}", "thread_id": None, "run_id": None, "tool_calls": []}
+                    print(f"[proxy] WxO error {resp.status_code}: {body[:300]}", flush=True)
+                    return {
+                        "reply": f"WxO error {resp.status_code}: {body[:200].decode()}",
+                        "thread_id": returned_thread_id,
+                        "run_id": None,
+                        "finished": False,
+                        "async_wait": False,
+                    }
 
                 async for raw_line in resp.aiter_lines():
                     if not raw_line.strip():
                         continue
 
-                    # SSE format: "data: {...}" or "event: done" or plain JSON
+                    # Strip SSE "data: " prefix
                     line = raw_line
                     if line.startswith("data:"):
                         line = line[5:].strip()
+
                     if not line or line == "[DONE]":
-                        continue
+                        break
 
                     try:
-                        event = json.loads(line)
+                        chunk = json.loads(line)
                     except json.JSONDecodeError:
                         continue
 
-                    event_type = event.get("event", "")
-                    data       = event.get("data", event)  # some events are flat
+                    obj = chunk.get("object", "")
+                    print(f"[proxy] SSE object={obj!r}", flush=True)
 
-                    # ── Capture IDs ───────────────────────────────────────
-                    if not thread_id:
-                        thread_id = (
-                            data.get("thread_id") or
-                            event.get("thread_id") or
-                            data.get("run", {}).get("thread_id")
-                        )
+                    # ── Capture thread_id ────────────────────────────────
+                    if not returned_thread_id:
+                        tid = chunk.get("thread_id")
+                        if tid:
+                            returned_thread_id = tid
+                            print(f"[proxy] thread_id={tid}", flush=True)
+
+                    # ── Capture run_id (needed for async polling) ────────
                     if not run_id:
                         run_id = (
-                            data.get("run_id") or
-                            data.get("id") or
-                            event.get("run_id")
+                            chunk.get("run_id") or
+                            chunk.get("id") or
+                            chunk.get("data", {}).get("run_id")
                         )
 
-                    # ── Text delta ────────────────────────────────────────
-                    if event_type in ("message.delta", "run.step.delta"):
-                        # Try multiple shapes WxO uses
-                        delta_text = (
-                            data.get("delta", {}).get("content", [{}])[0].get("text", "") or
-                            data.get("text", "") or
-                            data.get("content", "")
-                        )
-                        if delta_text:
-                            reply_chunks.append(delta_text)
+                    # ── Final completed message ──────────────────────────
+                    if obj == "thread.message.completed":
+                        try:
+                            text = chunk["data"]["message"]["content"][0]["text"]
+                            print(f"[proxy] completed: {text[:120]!r}", flush=True)
+                            if not is_flow_noise(text):
+                                final_texts.append(text)
+                        except (KeyError, IndexError, TypeError):
+                            pass
+                        continue
 
-                    # ── Full message completed ────────────────────────────
-                    elif event_type == "message.completed":
-                        msg_content = data.get("content", [])
-                        if isinstance(msg_content, list):
-                            for block in msg_content:
-                                if isinstance(block, dict) and block.get("type") == "text":
-                                    reply_chunks.append(block.get("text", ""))
-                        elif isinstance(msg_content, str):
-                            reply_chunks.append(msg_content)
-
-                    # ── Tool use (async flow invocation) ─────────────────
-                    elif event_type == "run.step.completed":
-                        step = data.get("step_details", {})
-                        if step.get("type") == "tool_calls":
-                            for tc in step.get("tool_calls", []):
-                                tool_calls.append(tc)
-                                # Check if this is an async invocation
-                                if tc.get("type") == "function" and tc.get("function", {}).get("is_async"):
-                                    final_status = "async_wait"
-
-                    # ── Explicit async signal ─────────────────────────────
-                    elif event_type == "run.step.started":
-                        if data.get("type") == "tool_calls":
-                            # Check display_properties for is_async flag
-                            dp = data.get("additional_properties", {}).get("display_properties", {})
-                            if dp.get("is_async"):
-                                final_status = "async_wait"
-
-                    # ── message.interrupt = WxO paused for async ──────────
-                    elif event_type == "message.interrupt":
-                        final_status = "async_wait"
-                        print(f"[proxy] message.interrupt received — run is async_wait")
-
-                    # ── Done ──────────────────────────────────────────────
-                    elif event_type == "done":
-                        break
-
-                    # ── Error ─────────────────────────────────────────────
-                    elif event_type == "error":
-                        print(f"[proxy] SSE error event: {data}")
-                        final_status = "error"
-                        break
+                    # ── Streaming delta ──────────────────────────────────
+                    if obj in ("thread.message.delta", "chat.completion.chunk"):
+                        try:
+                            delta = chunk["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                reply_chunks.append(delta)
+                        except (KeyError, IndexError, TypeError):
+                            pass
+                        continue
 
     except httpx.ReadTimeout:
-        print("[proxy] SSE stream timed out — treating as async_wait")
-        final_status = "async_wait"
+        print("[proxy] SSE stream timed out", flush=True)
     except Exception as e:
-        print(f"[proxy] SSE stream exception: {e}")
-        final_status = "error"
+        print(f"[proxy] SSE exception: {e}", flush=True)
 
-    reply_text = "".join(reply_chunks).strip()
+    # Prefer thread.message.completed text; fall back to accumulated deltas
+    reply = (final_texts[-1] if final_texts else "".join(reply_chunks)).strip()
 
-    # If we got no text at all and no async signal, something is wrong
-    if not reply_text and final_status == "completed":
-        final_status = "error"
+    # async_wait = stream ended with no usable reply
+    async_wait = not reply
 
     return {
-        "status":     final_status,
-        "reply":      reply_text,
-        "thread_id":  thread_id,
+        "reply":      reply,
+        "thread_id":  returned_thread_id,
         "run_id":     run_id,
-        "tool_calls": tool_calls,
+        "finished":   bool(reply),
+        "async_wait": async_wait,
     }
 
-
-async def poll_until_async_completed(run_id: str, headers: dict) -> Optional[dict]:
+# ── ASYNC WAIT POLLING ────────────────────────────────────────────────────────
+async def poll_run_until_done(run_id: str, token: str) -> Optional[dict]:
     """
-    Poll GET /runs/{run_id} until status is async_completed (or failed/cancelled).
-    Returns the full run object, or None on timeout.
+    Poll GET /api/v1/orchestrate/runs/{run_id} until status leaves async_wait.
+    Returns the final run dict, or None on timeout.
     """
     if not run_id:
-        print("[proxy] poll_until_async_completed: no run_id, can't poll")
+        print("[proxy] poll: no run_id", flush=True)
         return None
 
-    poll_url = f"{WXO_HOST}/api/v1/orchestrate/runs/{run_id}"
+    url     = f"{WXO_BASE_URL}/api/v1/orchestrate/runs/{run_id}"
+    headers = {"Authorization": f"Bearer {token}"}
 
     for attempt in range(POLL_MAX_ATTEMPTS):
         await asyncio.sleep(POLL_INTERVAL_S)
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                resp = await client.get(poll_url, headers=headers)
+                resp = await client.get(url, headers=headers)
                 if resp.status_code != 200:
-                    print(f"[proxy] poll attempt {attempt}: HTTP {resp.status_code}")
+                    print(f"[proxy] poll attempt {attempt+1}: HTTP {resp.status_code}", flush=True)
                     continue
 
-                run_data = resp.json()
-                status   = run_data.get("status", "unknown")
-                print(f"[proxy] poll attempt {attempt+1}: status={status}")
+                data   = resp.json()
+                status = data.get("status", "unknown")
+                print(f"[proxy] poll attempt {attempt+1}: status={status}", flush=True)
 
                 if status in ("async_completed", "completed"):
-                    return run_data
+                    return data
                 if status in ("failed", "cancelled", "expired"):
-                    print(f"[proxy] run ended with status={status}")
-                    return run_data
+                    print(f"[proxy] run terminal status: {status}", flush=True)
+                    return data
 
         except Exception as e:
-            print(f"[proxy] poll exception on attempt {attempt}: {e}")
+            print(f"[proxy] poll exception attempt {attempt+1}: {e}", flush=True)
 
-    print(f"[proxy] poll_until_async_completed timed out after {POLL_MAX_ATTEMPTS}s for run_id={run_id}")
+    print(f"[proxy] poll timed out after {POLL_MAX_ATTEMPTS} attempts", flush=True)
     return None
 
-
-def extract_tool_results(completed_run: dict) -> list[dict]:
+# ── MAIN AGENT TURN (with async_wait loop) ────────────────────────────────────
+async def run_agent_turn(
+    agent_id: str,
+    user_message: str,
+    history: list[Message],
+    thread_id: Optional[str],
+) -> dict:
     """
-    Parse a completed run object to extract tool outputs.
+    Execute one user turn end-to-end, handling async_wait loops.
 
-    WxO stores tool results in run.result or in step_history.
-    Returns a list of { tool_call_id, tool_name, output }.
+    Strategy:
+      1. Build messages list (history + new user message).
+         On first turn: full history so agent has context.
+         On subsequent turns (thread established): just the new message —
+         WxO thread maintains state.
+      2. Stream the response.
+      3. If async_wait detected: poll for run completion, then send
+         a follow-up "please continue" message on the same thread.
+      4. Repeat up to ASYNC_LOOP_MAX times.
+
+    Returns { reply, thread_id, async_rounds }
     """
-    results = []
 
-    # Try run.result first (flat output)
-    run_result = completed_run.get("result")
-    if run_result:
-        if isinstance(run_result, dict):
-            results.append({
-                "tool_call_id": completed_run.get("id"),
-                "tool_name":    "flow_result",
-                "output":       run_result,
-            })
-        elif isinstance(run_result, str):
-            results.append({
-                "tool_call_id": completed_run.get("id"),
-                "tool_name":    "flow_result",
-                "output":       run_result,
-            })
+    # Build initial messages list
+    # First turn: include history so agent has full context
+    # Subsequent turns: thread_id carries state, just send latest message
+    if thread_id:
+        messages = [{"role": "user", "content": user_message}]
+    else:
+        messages = [{"role": m.role, "content": m.content} for m in history]
+        messages.append({"role": "user", "content": user_message})
 
-    # Also check step_history for tool_calls with outputs
-    step_history = completed_run.get("step_history", [])
-    for step in step_history:
-        step_details = step.get("step_details", {})
-        if step_details.get("type") == "tool_calls":
-            for tc in step_details.get("tool_calls", []):
-                output = tc.get("function", {}).get("output")
-                if output:
-                    results.append({
-                        "tool_call_id": tc.get("id"),
-                        "tool_name":    tc.get("function", {}).get("name", "unknown"),
-                        "output":       output,
-                    })
+    current_thread_id = thread_id
+    async_rounds      = 0
 
-    return results
+    for loop in range(ASYNC_LOOP_MAX + 1):
+        result = await call_agent_stream(
+            agent_id  = agent_id,
+            messages  = messages,
+            thread_id = current_thread_id,
+        )
 
+        current_thread_id = result["thread_id"] or current_thread_id
+
+        # ── Clean completion ──────────────────────────────────────────────
+        if result["finished"]:
+            return {
+                "reply":        result["reply"],
+                "thread_id":    current_thread_id,
+                "async_rounds": async_rounds,
+            }
+
+        # ── async_wait — a flow tool was called ───────────────────────────
+        if result["async_wait"]:
+            async_rounds += 1
+            run_id = result.get("run_id")
+            print(f"[proxy] async_wait on loop {loop}, run_id={run_id}", flush=True)
+
+            token       = await get_iam_token()
+            completed   = await poll_run_until_done(run_id, token)
+
+            if not completed:
+                return {
+                    "reply":        "A background tool is taking too long. Please try again.",
+                    "thread_id":    current_thread_id,
+                    "async_rounds": async_rounds,
+                }
+
+            status = completed.get("status", "")
+            if status in ("failed", "cancelled", "expired"):
+                return {
+                    "reply":        f"A background tool ended with status: {status}. Please try again.",
+                    "thread_id":    current_thread_id,
+                    "async_rounds": async_rounds,
+                }
+
+            # Tool completed — send a follow-up on the same thread to resume
+            print(f"[proxy] flow completed, resuming agent on thread={current_thread_id}", flush=True)
+            messages = [{"role": "user", "content": "Please continue."}]
+            continue
+
+        # ── Unexpected empty reply (not async_wait, not finished) ─────────
+        break
+
+    return {
+        "reply":        "Something went wrong. Please try again.",
+        "thread_id":    current_thread_id,
+        "async_rounds": async_rounds,
+    }
 
 # ── ROUTES ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.1.0"}
 
 
 @app.post("/auth")
 async def auth(req: AuthRequest):
-    """Auth route — calls Auth Agent to look up the rep's Salesforce User ID."""
+    """Auth route — calls Auth Agent to look up Salesforce User ID."""
     try:
         result = await run_agent_turn(
-            agent_id=AUTH_AGENT_ID,
-            message_text=req.message,
-            history=req.history,
-            thread_id=req.thread_id,
+            agent_id    = AUTH_AGENT_ID,
+            user_message = req.message,
+            history     = req.history,
+            thread_id   = req.thread_id,
         )
+        updated_history = [m.dict() for m in req.history] + [
+            {"role": "user",      "content": req.message},
+            {"role": "assistant", "content": result["reply"]},
+        ]
         return {
-            "reply":      result["reply"],
-            "thread_id":  result["thread_id"],
-            "history":    [m.dict() for m in req.history] + [
-                {"role": "user",      "content": req.message},
-                {"role": "assistant", "content": result["reply"]},
-            ],
+            "reply":     result["reply"],
+            "thread_id": result["thread_id"],
+            "history":   updated_history,
         }
     except Exception as e:
-        print(f"[proxy] /auth error: {e}")
+        print(f"[proxy] /auth error: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
-    """
-    Main chat route — calls Orchestrator V2 with async_wait loop.
-    Passes owner_id and user_email as context_variables so the agent
-    can use them without asking (auth simplification, TC Auth).
-    """
-    context_vars = {}
-    if req.owner_id:
-        context_vars["owner_id"] = req.owner_id
-    if req.user_email:
-        context_vars["wxo_email_id"] = req.user_email
-
+    """Main chat route — calls Orchestrator V2 with async_wait loop."""
     try:
         result = await run_agent_turn(
-            agent_id=ORCHESTRATOR_ID,
-            message_text=req.message,
-            history=req.history,
-            thread_id=req.thread_id,
-            context_variables=context_vars,
+            agent_id    = ORCHESTRATOR_ID,
+            user_message = req.message,
+            history     = req.history,
+            thread_id   = req.thread_id,
         )
+        updated_history = [m.dict() for m in req.history] + [
+            {"role": "user",      "content": req.message},
+            {"role": "assistant", "content": result["reply"]},
+        ]
         return {
             "reply":        result["reply"],
             "thread_id":    result["thread_id"],
             "async_rounds": result["async_rounds"],
-            "history":      [m.dict() for m in req.history] + [
-                {"role": "user",      "content": req.message},
-                {"role": "assistant", "content": result["reply"]},
-            ],
+            "history":      updated_history,
         }
     except Exception as e:
-        print(f"[proxy] /chat error: {e}")
+        print(f"[proxy] /chat error: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
